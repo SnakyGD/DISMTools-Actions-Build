@@ -1,0 +1,101 @@
+name: Build Installer
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BUILD_ROOT: C:\DISMTools-Build
+
+jobs:
+  build-installer:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: powershell
+        working-directory: C:\DISMTools-Build
+    steps:
+      - name: Check out source and dependencies
+        uses: actions/checkout@v7.0.1
+        with:
+          submodules: recursive
+          lfs: true
+          persist-credentials: false
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v3
+
+      - name: Copy source to the system drive
+        working-directory: ${{ github.workspace }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & robocopy $env:GITHUB_WORKSPACE $env:BUILD_ROOT /E /R:2 /W:1 /NFL /NDL /NJH /NJS /NP
+          if ($LASTEXITCODE -ge 8) {
+            throw "Source copy failed with exit code $LASTEXITCODE."
+          }
+          # Robocopy returns nonzero success codes when files were copied.
+          $global:LASTEXITCODE = 0
+
+      - name: Prepare dependencies
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & .\nugetpkgprep.bat
+          if ($LASTEXITCODE -ne 0) {
+            throw "Package preparation failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Make dependencies available at project paths
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $packageRoot = Join-Path $env:BUILD_ROOT 'packages'
+          $solution = Get-Content 'DISMTools.sln'
+          foreach ($line in $solution) {
+            if ($line -notmatch '^Project\(".*"\) = ".*", "([^"]+\.(?:vbproj|csproj|vcxproj))",') {
+              continue
+            }
+            $projectPath = Join-Path $env:BUILD_ROOT $Matches[1]
+            [xml]$project = Get-Content -LiteralPath $projectPath -Raw
+            foreach ($hint in $project.SelectNodes('//*[local-name()="Reference"]/*[local-name()="HintPath"]')) {
+              if ($hint.InnerText -notmatch '^(.*?\bpackages)\\(.+)$') {
+                continue
+              }
+              $expectedRoot = [IO.Path]::GetFullPath((Join-Path (Split-Path $projectPath) $Matches[1]))
+              $relativeDll = $Matches[2]
+              $expectedDll = Join-Path $expectedRoot $relativeDll
+              if (Test-Path -LiteralPath $expectedDll -PathType Leaf) {
+                continue
+              }
+              $sourceDll = Join-Path $packageRoot $relativeDll
+              if (-not (Test-Path -LiteralPath $sourceDll -PathType Leaf)) {
+                throw "Dependency missing for ${projectPath}: $sourceDll"
+              }
+              if (Test-Path -LiteralPath $expectedRoot) {
+                throw "The existing package directory lacks the dependency: $expectedDll"
+              }
+              if (-not $expectedRoot.StartsWith("$($env:BUILD_ROOT)\", [StringComparison]::OrdinalIgnoreCase)) {
+                throw "Package path is outside the build directory: $expectedRoot"
+              }
+              New-Item -Path $expectedRoot -ItemType Junction -Target $packageRoot | Out-Null
+              Write-Host "Linked $expectedRoot -> $packageRoot"
+            }
+          }
+
+      - name: Build application and installer
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & msbuild DISMTools.sln /t:Build /p:Configuration=Release "/p:Platform=Any CPU"
+          if ($LASTEXITCODE -ne 0) {
+            throw "MSBuild failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: DISMTools-installer
+          path: C:/DISMTools-Build/Installer/Output/dt_setup.exe
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
